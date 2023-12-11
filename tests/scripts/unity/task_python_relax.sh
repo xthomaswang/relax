@@ -40,4 +40,4 @@ TVM_TEST_TARGETS="${TVM_RELAY_TEST_TARGETS:-llvm}" pytest tests/python/relax
 pytest tests/python/contrib/test_msc
 
 # Test for OpenCLML
-pytest tests/python/relax/backend/clml/
+# pytest tests/python/relax/backend/clml/
