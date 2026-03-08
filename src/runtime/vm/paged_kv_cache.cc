@@ -1317,11 +1317,14 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
 
     Tensor qkv_data_view = qkv_data;
     Tensor o_data_view = o_data;
+    Tensor lse_data_view = merged_attn_lse_view_;
     if (total_seq_length != qkv_data->shape[0]) {
       qkv_data_view = qkv_data.CreateView(
           {total_seq_length, qkv_data->shape[1], qkv_data->shape[2]}, qkv_data->dtype);
       o_data_view =
           o_data.CreateView({total_seq_length, num_qo_heads_, qk_head_dim_}, qkv_data->dtype);
+      lse_data_view = merged_attn_lse_view_.CreateView(
+          {total_seq_length, num_qo_heads_}, merged_attn_lse_view_.dtype);
     }
     // Part 2. Split fused qkv and apply rotary embedding to q/k data.
     if (transfer_kv_) {
@@ -1364,7 +1367,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
                              kv_transfer_stream_);
     }
     // Part 5: perform attention
-    AttentionInternal(layer_id, q_data, k_data, v_data, o_data_view, sm_scale);
+    AttentionInternal(layer_id, q_data, k_data, v_data, o_data_view, lse_data_view, sm_scale);
     // Part 6. Append k/v data to kv-cache if flag "append_before_attn" is not set.
     if (!append_before_attn_) {
       f_transpose_append_mha_.value()(pages_[local_layer_id], k_data, v_data,
@@ -1640,7 +1643,9 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
         append_position_map.data() + start_pos,
         (end_pos - start_pos) * ((dtype_aux_.bits * dtype_aux_.lanes + 7) / 8));
     for (int64_t layer_id = 0; layer_id < num_layers_; ++layer_id) {
-      CHECK(attn_kinds_[layer_id] == AttnKind::kMHA) << "Only MHA is supported for DebugGetKV";
+      CHECK(attn_kinds_[layer_id] == AttnKind::kMHA ||
+            attn_kinds_[layer_id] == AttnKind::kMHASliding)
+          << "DebugGetKV only supports MHA-style KV cache layouts";
       f_debug_get_kv_.value()(pages_[layer_id], position_map_device, k_data, v_data, layer_id);
     }
   }
@@ -2080,7 +2085,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
    * input k/v data and the k/v data in cache on the given layer.
    */
   void AttentionInternal(int64_t layer_id, Tensor q_data, Tensor k_data, Tensor v_data,
-                         Tensor output, double sm_scale) {
+                         Tensor output, Tensor lse_data, double sm_scale) {
     int64_t local_layer_id = layer_id - layer_id_begin_offset_;
     CHECK_GE(local_layer_id, 0);
     CHECK_LT(local_layer_id, num_layers_);
@@ -2089,11 +2094,11 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
     if (!append_before_attn_) {
       // The first part of attention, which only involves the q and the newly appended k/v.
       is_first_kernel = false;
-      MHASelfAttnInternal(q_data, k_data, v_data, output, merged_attn_lse_view_, sm_scale);
+      MHASelfAttnInternal(q_data, k_data, v_data, output, lse_data, sm_scale);
     }
     bool self_attn_computed = !is_first_kernel;
-    bool cross_attn_computed = MHACrossAttnInternal(
-        local_layer_id, q_data, output, merged_attn_lse_view_, sm_scale, is_first_kernel);
+    bool cross_attn_computed =
+        MHACrossAttnInternal(local_layer_id, q_data, output, lse_data, sm_scale, is_first_kernel);
     CHECK(self_attn_computed || cross_attn_computed)
         << "Both self-attention and cross-attention are not computed.";
   }
