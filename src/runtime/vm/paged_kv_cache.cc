@@ -1324,7 +1324,7 @@ class PagedAttentionKVCacheObj : public AttentionKVCacheObj {
       o_data_view =
           o_data.CreateView({total_seq_length, num_qo_heads_, qk_head_dim_}, qkv_data->dtype);
       lse_data_view = merged_attn_lse_view_.CreateView(
-          {total_seq_length, num_qo_heads_}, merged_attn_lse_view_.dtype);
+          {total_seq_length, num_qo_heads_}, merged_attn_lse_view_.dtype());
     }
     // Part 2. Split fused qkv and apply rotary embedding to q/k data.
     if (transfer_kv_) {
