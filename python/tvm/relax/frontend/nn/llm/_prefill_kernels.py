@@ -212,7 +212,7 @@ def _attention_prefill(h_kv, h_q, d, dtype, sliding_window: bool, rope_scaling: 
     if sliding_window:
         global_symbol += "_sliding_window"
 
-    init_states, compute_s_gemm, softmax_update_causal, compute_o_gemm, _, advance_tile_batch, paged_store_output_lse = _make_prefill_macros(tile_x, tile_y, tile_z, tile_y, bdx, num_warps, group_size)
+    init_states, compute_s_gemm, softmax_update_causal, compute_o_gemm, _, advance_tile_batch, paged_store_output_lse, *_ = _make_prefill_macros(tile_x, tile_y, tile_z, tile_y, bdx, num_warps, group_size)
 
     # pylint: disable=too-many-branches
     @T.prim_func
@@ -489,24 +489,35 @@ def _attention_sequence_prefill(h_kv, h_q, d, dtype, target: Target, causal=0, s
 
 
 
-def _attention_sequence_prefill_with_mask(h_kv, h_q, d, dtype, target: Target, sm_scale=1.0):
-    """Tiled sequence prefill kernel with a per-batch right-padding mask.
+def _attention_sequence_prefill_with_mask(h_kv, h_q, d, dtype, target: Target, sm_scale=1.0, mask_mode="padded"):
+    """Tiled sequence prefill kernel with a per-batch padding mask.
 
     This is the counterpart of :func:`_attention_sequence_prefill` for batched
-    encoder-style inputs where each sample in the batch is padded to a common
+    inputs where each sample in the batch is padded to a common
     ``seq_len`` but only the first ``valid_lens[b]`` tokens carry real content.
     The kernel takes an extra ``valid_lens`` buffer of shape ``(batch_size,)``
     and applies the padding mask inside the QKV load path and the online
     softmax update, so no explicit mask tensor broadcast or additive bias is
     needed on the host side.
 
-    Semantics: for batch ``b``, positions ``[0, valid_lens[b])`` are real and
-    positions ``[valid_lens[b], seq_len)`` are padding. Padding queries and
-    keys/values are zeroed at load time; padded ``(row, col)`` pairs are
-    excluded from the max/sum of the online softmax via a ``-inf`` slot.
+    ``mask_mode="padded"`` treats positions ``[0, valid_lens[b])`` as real.
+    ``mask_mode="causal_padded_left"`` treats the final ``valid_lens[b]``
+    positions as real and applies causal masking for decoder embedding models.
     """
+    if mask_mode not in ("padded", "causal_padded_left"):
+        raise ValueError(f"Unsupported masked sequence prefill mode: {mask_mode}")
+    left_padded_causal = mask_mode == "causal_padded_left"
     _, LOAD_VEC, group_size, bdx, num_warps, tile_x, tile_y, tile_z = _get_prefill_kernel_config(h_kv, h_q, d, dtype, target)
-    init_states, compute_s_gemm, _, compute_o_gemm, softmax_update_valid_length, *_ = _make_prefill_macros(tile_x, tile_y, tile_z, tile_y, bdx, num_warps, group_size)
+    (
+        init_states,
+        compute_s_gemm,
+        _,
+        compute_o_gemm,
+        softmax_update_valid_length,
+        *unused_macros,
+        softmax_update_left_padded_causal,
+    ) = _make_prefill_macros(tile_x, tile_y, tile_z, tile_y, bdx, num_warps, group_size)
+    assert unused_macros is not None
 
     @T.prim_func
     def batch_sequence_prefill_kv_masked(  # pylint: disable=too-many-branches
@@ -547,6 +558,8 @@ def _attention_sequence_prefill_with_mask(h_kv, h_q, d, dtype, target: Target, s
                             valid_len: T.int32 = valid_lens[b_idx]
                             tile_id: T.int32 = vbx % batch_tiles
                             LH_start: T.int32 = tile_id * tile_x
+                            q_start: T.int32 = qo_len - valid_len
+                            kv_start: T.int32 = kv_len - valid_len
                             T.tvm_storage_sync("shared")
 
                             init_states(m_smem, d_smem, O_local, ty, tx)
@@ -559,10 +572,16 @@ def _attention_sequence_prefill_with_mask(h_kv, h_q, d, dtype, target: Target, s
                                     T.writes()
                                     cur_L = (LH_start + i) // group_size
                                     cur_H_qo = by * group_size + (LH_start + i) % group_size
-                                    if tirx.And(cur_L < qo_len, cur_L < valid_len):
-                                        Q_smem[i, j] = q[b_idx, cur_L, cur_H_qo, j]
+                                    if left_padded_causal:
+                                        if tirx.And(cur_L < qo_len, cur_L >= q_start):
+                                            Q_smem[i, j] = q[b_idx, cur_L, cur_H_qo, j]
+                                        else:
+                                            Q_smem[i, j] = 0.0
                                     else:
-                                        Q_smem[i, j] = 0.0
+                                        if tirx.And(cur_L < qo_len, cur_L < valid_len):
+                                            Q_smem[i, j] = q[b_idx, cur_L, cur_H_qo, j]
+                                        else:
+                                            Q_smem[i, j] = 0.0
                             T.tvm_storage_sync("shared")
 
                             for iterator in T.serial(T.ceildiv(kv_len, tile_z)):
@@ -574,10 +593,16 @@ def _attention_sequence_prefill_with_mask(h_kv, h_q, d, dtype, target: Target, s
                                         T.reads()
                                         T.writes()
                                         cur_L = L_kv_start + i
-                                        if tirx.And(cur_L < kv_len, cur_L < valid_len):
-                                            K_smem[i, j] = k[b_idx, L_kv_base + cur_L, by, j]
+                                        if left_padded_causal:
+                                            if tirx.And(cur_L < kv_len, cur_L >= kv_start):
+                                                K_smem[i, j] = k[b_idx, L_kv_base + cur_L, by, j]
+                                            else:
+                                                K_smem[i, j] = 0.0
                                         else:
-                                            K_smem[i, j] = 0.0
+                                            if tirx.And(cur_L < kv_len, cur_L < valid_len):
+                                                K_smem[i, j] = k[b_idx, L_kv_base + cur_L, by, j]
+                                            else:
+                                                K_smem[i, j] = 0.0
                                 T.tvm_storage_sync("shared")
                                 for lz, ly in T.grid(tile_z, tile_y):
                                     with T.sblock("V_load"):
@@ -585,14 +610,23 @@ def _attention_sequence_prefill_with_mask(h_kv, h_q, d, dtype, target: Target, s
                                         T.reads()
                                         T.writes()
                                         cur_L = L_kv_start + i
-                                        if tirx.And(cur_L < kv_len, cur_L < valid_len):
-                                            V_smem[i, j] = v[b_idx, L_kv_base + cur_L, by, j]
+                                        if left_padded_causal:
+                                            if tirx.And(cur_L < kv_len, cur_L >= kv_start):
+                                                V_smem[i, j] = v[b_idx, L_kv_base + cur_L, by, j]
+                                            else:
+                                                V_smem[i, j] = 0.0
                                         else:
-                                            V_smem[i, j] = 0.0
+                                            if tirx.And(cur_L < kv_len, cur_L < valid_len):
+                                                V_smem[i, j] = v[b_idx, L_kv_base + cur_L, by, j]
+                                            else:
+                                                V_smem[i, j] = 0.0
                                 T.tvm_storage_sync("shared")
 
                                 compute_s_gemm(Q_smem, K_smem, S_local, S_smem, sm_scale)
-                                softmax_update_valid_length(S_smem, m_smem, d_smem, m_prev_smem, m_new, m_prev, d_new, ty, tx, LH_start, L_kv_start, valid_len, qo_len)
+                                if left_padded_causal:
+                                    softmax_update_left_padded_causal(S_smem, m_smem, d_smem, m_prev_smem, m_new, m_prev, d_new, ty, tx, LH_start, L_kv_start, valid_len, kv_len, qo_len)
+                                else:
+                                    softmax_update_valid_length(S_smem, m_smem, d_smem, m_prev_smem, m_new, m_prev, d_new, ty, tx, LH_start, L_kv_start, valid_len, qo_len)
                                 compute_o_gemm(S_smem, V_smem, O_local, m_prev_smem, m_smem)
 
                             # Store O
@@ -741,7 +775,7 @@ def _attention_prefill_ragged_cpu(h_kv, h_q, d_qk, d_v, dtype, rope_scaling: dic
 
 def _attention_prefill_ragged(h_kv, h_q, d_qk, d_v, dtype, rope_scaling: dict[str, Any], target: Target):
     NUM_BLKS, LOAD_VEC, group_size, bdx, num_warps, tile_x, tile_y, tile_z = _get_prefill_kernel_config(h_kv, h_q, d_qk, dtype, target)
-    init_states, compute_s_gemm, softmax_update_causal, compute_o_gemm, _, advance_tile_batch, paged_store_output_lse = _make_prefill_macros(tile_x, tile_y, tile_z, d_v, bdx, num_warps, group_size)
+    init_states, compute_s_gemm, softmax_update_causal, compute_o_gemm, _, advance_tile_batch, paged_store_output_lse, *_ = _make_prefill_macros(tile_x, tile_y, tile_z, d_v, bdx, num_warps, group_size)
 
     @T.prim_func
     def batch_prefill_ragged_kv(  # pylint: disable=too-many-branches
@@ -874,7 +908,7 @@ def _attention_prefill_ragged(h_kv, h_q, d_qk, d_v, dtype, rope_scaling: dict[st
 def _attention_prefill_mla(h_q, d_latent, d_rope, dtype, sliding_window: bool, target: Target, page_size: int = 16):
     d_qk = d_latent + d_rope
     NUM_BLKS, LOAD_VEC, group_size, bdx, num_warps, tile_x, tile_y, tile_z = _get_prefill_kernel_config(1, h_q, d_qk, dtype, target)
-    init_states, compute_s_gemm, softmax_update_causal, compute_o_gemm, _, advance_tile_batch, paged_store_output_lse = _make_prefill_macros(tile_x, tile_y, tile_z, d_latent, bdx, num_warps, group_size)
+    init_states, compute_s_gemm, softmax_update_causal, compute_o_gemm, _, advance_tile_batch, paged_store_output_lse, *_ = _make_prefill_macros(tile_x, tile_y, tile_z, d_latent, bdx, num_warps, group_size)
 
     global_symbol = "batch_prefill_paged_kv_mla"
     if sliding_window:
